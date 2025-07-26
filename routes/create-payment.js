@@ -33,9 +33,11 @@ router.post('/create-payment', async (req, res) => {
       });
     }
 
-    if (isNaN(amount) {
-      return res.status(400).json({ error: 'Amount must be a number' });
-    }
+  
+
+    if (isNaN(amount)) { 
+  return res.status(400).json({ error: 'Amount must be a number' });
+}
 
     // Create payment invoice
     const invoiceData = {
