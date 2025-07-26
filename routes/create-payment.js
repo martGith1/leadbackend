@@ -1,54 +1,94 @@
+require('dotenv').config();
 const express = require('express');
 const axios = require('axios');
-const { getFirestore } = require('firebase-admin/firestore');
+const { getFirestore, FieldValue } = require('firebase-admin/firestore');
 const router = express.Router();
 const { initializeApp, cert } = require('firebase-admin/app');
 const serviceAccount = require('../firebase-admin.json');
 
 // Initialize Firebase
-initializeApp({ credential: cert(serviceAccount) });
+initializeApp({
+  credential: cert(serviceAccount),
+  databaseURL: process.env.FIREBASE_DATABASE_URL // Add to .env
+});
+
 const db = getFirestore();
+
+// Constants
+const NOWPAYMENTS_API = 'https://api.nowpayments.io/v1/invoice';
+const SUCCESS_URL = process.env.PAYMENT_SUCCESS_URL || 'http://localhost:5173/top-up-success';
+const CANCEL_URL = process.env.PAYMENT_CANCEL_URL || 'http://localhost:5173/top-up-cancel';
+const WEBHOOK_URL = process.env.PAYMENT_WEBHOOK_URL || `${process.env.RENDER_EXTERNAL_URL}/api/payment-webhook`;
 
 // Payment creation endpoint
 router.post('/create-payment', async (req, res) => {
   try {
     const { amount, email, uid } = req.body;
+    
+    // Validation
     if (!amount || !email || !uid) {
-      return res.status(400).json({ error: 'Missing required fields' });
+      return res.status(400).json({ 
+        error: 'Missing required fields',
+        required: ['amount', 'email', 'uid']
+      });
     }
 
-    const response = await axios.post(
-      'https://api.nowpayments.io/v1/invoice',
-      {
-        price_amount: amount,
-        price_currency: 'usd',
-        pay_currency: 'usdttrc20',
-        order_description: `Top-up for ${email}`,
-        success_url: 'http://localhost:5173/top-up-success',
-        cancel_url: 'http://localhost:5173/top-up-cancel',
-        ipn_callback_url: 'https://f00e75544225.ngrok-free.app/api/payment-webhook'
+    if (isNaN(amount) {
+      return res.status(400).json({ error: 'Amount must be a number' });
+    }
+
+    // Create payment invoice
+    const invoiceData = {
+      price_amount: parseFloat(amount),
+      price_currency: 'usd',
+      pay_currency: 'usdttrc20',
+      order_description: `Top-up for ${email}`,
+      success_url: SUCCESS_URL,
+      cancel_url: CANCEL_URL,
+      ipn_callback_url: WEBHOOK_URL
+    };
+
+    const response = await axios.post(NOWPAYMENTS_API, invoiceData, {
+      headers: { 
+        'x-api-key': process.env.NOWPAYMENTS_API_KEY,
+        'Content-Type': 'application/json'
       },
-      {
-        headers: { 'x-api-key': process.env.NOWPAYMENTS_API_KEY }
-      }
-    );
+      timeout: 10000 // 10 second timeout
+    });
 
     const invoice = response.data;
+
+    // Save to Firestore
     await db.collection('topups').doc(invoice.invoice_id).set({
-      uid, email, amount,
+      uid,
+      email,
+      amount: parseFloat(amount),
       invoice_id: invoice.invoice_id,
       invoice_url: invoice.invoice_url,
       status: invoice.invoice_status || 'pending',
-      createdAt: new Date()
+      created_at: FieldValue.serverTimestamp(),
+      updated_at: FieldValue.serverTimestamp()
     });
 
     res.json({
+      success: true,
       invoice_url: invoice.invoice_url,
-      payment_id: invoice.invoice_id
+      payment_id: invoice.invoice_id,
+      status: invoice.invoice_status
     });
+
   } catch (error) {
-    console.error('Payment creation error:', error.response?.data || error.message);
-    res.status(500).json({ error: 'Failed to create payment' });
+    console.error('Payment Error:', {
+      request: error.config,
+      response: error.response?.data,
+      message: error.message
+    });
+
+    const statusCode = error.response?.status || 500;
+    res.status(statusCode).json({
+      error: 'Payment creation failed',
+      details: process.env.NODE_ENV === 'development' ? error.message : undefined
+    });
   }
 });
 
@@ -56,29 +96,55 @@ router.post('/create-payment', async (req, res) => {
 router.get('/payment-status/:paymentId', async (req, res) => {
   try {
     const { paymentId } = req.params;
-    if (!paymentId) return res.status(400).json({ error: 'Missing payment ID' });
-
-    const response = await axios.get(
-      `https://api.nowpayments.io/v1/invoice/${paymentId}`,
-      { headers: { 'x-api-key': process.env.NOWPAYMENTS_API_KEY } }
-    );
-
-    const status = response.data.invoice_status;
-    await db.collection('topups').doc(paymentId).update({ status });
-
-    if (status === 'confirmed' || status === 'finished') {
-      const doc = await db.collection('topups').doc(paymentId).get();
-      const { uid, amount } = doc.data();
-      
-      await db.collection('users').doc(uid).update({
-        balance: admin.firestore.FieldValue.increment(amount)
-      });
+    
+    if (!paymentId) {
+      return res.status(400).json({ error: 'Payment ID is required' });
     }
 
-    res.json({ status });
+    // Check payment status
+    const response = await axios.get(`${NOWPAYMENTS_API}/${paymentId}`, {
+      headers: { 'x-api-key': process.env.NOWPAYMENTS_API_KEY },
+      timeout: 5000
+    });
+
+    const status = response.data.invoice_status;
+
+    // Update Firestore
+    const batch = db.batch();
+    const topupRef = db.collection('topups').doc(paymentId);
+    
+    batch.update(topupRef, { 
+      status,
+      updated_at: FieldValue.serverTimestamp() 
+    });
+
+    // Update user balance if payment completed
+    if (status === 'confirmed' || status === 'finished') {
+      const doc = await topupRef.get();
+      if (doc.exists) {
+        const { uid, amount } = doc.data();
+        const userRef = db.collection('users').doc(uid);
+        batch.update(userRef, {
+          balance: FieldValue.increment(parseFloat(amount))
+        });
+      }
+    }
+
+    await batch.commit();
+
+    res.json({ 
+      success: true,
+      status 
+    });
+
   } catch (error) {
-    console.error('Status check error:', error.response?.data || error.message);
-    res.status(500).json({ error: 'Failed to check status' });
+    console.error('Status Check Error:', error.message);
+    
+    const statusCode = error.response?.status || 500;
+    res.status(statusCode).json({
+      error: 'Failed to check payment status',
+      details: process.env.NODE_ENV === 'development' ? error.message : undefined
+    });
   }
 });
 
@@ -86,28 +152,40 @@ router.get('/payment-status/:paymentId', async (req, res) => {
 router.post('/payment-webhook', express.raw({ type: '*/*' }), async (req, res) => {
   try {
     const { payment_status, invoice_id } = req.body;
+
     if (!payment_status || !invoice_id) {
+      console.warn('Invalid webhook payload:', req.body);
       return res.status(400).json({ error: 'Invalid webhook data' });
     }
 
-    await db.collection('topups').doc(invoice_id).update({
+    const batch = db.batch();
+    const topupRef = db.collection('topups').doc(invoice_id);
+
+    batch.update(topupRef, {
       status: payment_status,
-      updatedAt: new Date()
+      updated_at: FieldValue.serverTimestamp()
     });
 
     if (payment_status === 'confirmed' || payment_status === 'finished') {
-      const doc = await db.collection('topups').doc(invoice_id).get();
-      const { uid, amount } = doc.data();
-      
-      await db.collection('users').doc(uid).update({
-        balance: admin.firestore.FieldValue.increment(amount)
-      });
+      const doc = await topupRef.get();
+      if (doc.exists) {
+        const { uid, amount } = doc.data();
+        const userRef = db.collection('users').doc(uid);
+        batch.update(userRef, {
+          balance: FieldValue.increment(parseFloat(amount))
+        });
+      }
     }
 
-    res.status(200).send('Webhook processed');
+    await batch.commit();
+    res.status(200).send('OK');
+
   } catch (error) {
-    console.error('Webhook error:', error);
-    res.status(500).json({ error: 'Webhook processing failed' });
+    console.error('Webhook Processing Error:', error);
+    res.status(500).json({ 
+      error: 'Webhook processing failed',
+      details: process.env.NODE_ENV === 'development' ? error.message : undefined
+    });
   }
 });
 
